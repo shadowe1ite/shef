@@ -1,4 +1,4 @@
-module github.com/1hehaq/shef
+module github.com/shadowe1ite/shef
 
 go 1.24.5
 
