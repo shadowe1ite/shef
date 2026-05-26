@@ -5,10 +5,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/blang/semver"
@@ -54,12 +57,12 @@ func main() {
 	}()
 
 	query, facet, jsonOutput, listFacets, showHelp := parseFlags()
-	
+
 	if showHelp {
 		displayHelp()
 		return
 	}
-	
+
 	if listFacets {
 		displayFacets()
 		return
@@ -121,12 +124,12 @@ func displayHelp() {
 	flagStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
 	requiredStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	successStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	
+
 	fmt.Println()
 	fmt.Println(successStyle.Render(" example:"))
 	fmt.Printf("    %s -q %s -f %s\n", cmdStyle.Render("shef"), argStyle.Render("hackerone.com"), argStyle.Render("ports"))
 	fmt.Printf("    %s -q %s -json\n\n", cmdStyle.Render("shef"), argStyle.Render("apache"))
-	
+
 	fmt.Println(successStyle.Render(" options:"))
 	fmt.Printf("    %s      search query %s\n", flagStyle.Render("-q"), requiredStyle.Render("(required)"))
 	fmt.Printf("    %s      facet type %s\n", flagStyle.Render("-f"), argStyle.Render("(default: ip)"))
@@ -135,7 +138,7 @@ func displayHelp() {
 	fmt.Printf("    %s      show version\n", flagStyle.Render("-v"))
 	fmt.Printf("    %s     update to latest version\n", flagStyle.Render("-up"))
 	fmt.Printf("    %s      show this help message\n\n", flagStyle.Render("-h"))
-	
+
 	fmt.Println(argStyle.Render("usage of shodan for attacking targets without prior mutual consent is illegal!"))
 	fmt.Println()
 }
@@ -143,7 +146,7 @@ func displayHelp() {
 func displayVersion() {
 	highlightStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
 	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	
+
 	fmt.Println()
 	fmt.Printf("%s %s\n", highlightStyle.Render("shef"), dimStyle.Render("v"+version))
 	fmt.Println()
@@ -154,23 +157,23 @@ func performUpdate() {
 	errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
 	successStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
 	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	
+
 	fmt.Println()
 	fmt.Println(highlightStyle.Render("checking for updates..."))
-	
+
 	latest, found, err := selfupdate.DetectLatest("1hehaq/shef")
 	if err != nil {
 		fmt.Printf("%s %s\n", errorStyle.Render("✗"), dimStyle.Render("error checking for updates: "+err.Error()))
 		fmt.Println()
 		os.Exit(1)
 	}
-	
+
 	if !found {
 		fmt.Printf("%s %s\n", errorStyle.Render("✗"), dimStyle.Render("no releases found"))
 		fmt.Println()
 		os.Exit(1)
 	}
-	
+
 	currentVersion := "v" + version
 	v, err := semver.ParseTolerant(strings.TrimPrefix(currentVersion, "v"))
 	if err != nil {
@@ -178,38 +181,36 @@ func performUpdate() {
 		fmt.Println()
 		os.Exit(1)
 	}
-	
+
 	if !latest.Version.GT(v) {
 		fmt.Printf("%s %s\n", successStyle.Render("✓"), dimStyle.Render("already up to date ("+currentVersion+")"))
 		fmt.Println()
 		return
 	}
-	
+
 	exe, err := os.Executable()
 	if err != nil {
 		fmt.Printf("%s %s\n", errorStyle.Render("✗"), dimStyle.Render("could not locate executable: "+err.Error()))
 		fmt.Println()
 		os.Exit(1)
 	}
-	
+
 	fmt.Printf("  %s → %s\n", dimStyle.Render(currentVersion), highlightStyle.Render(latest.Version.String()))
 	fmt.Println()
 	fmt.Print(dimStyle.Render("  updating... "))
-	
+
 	if err := selfupdate.UpdateTo(latest.AssetURL, exe); err != nil {
 		fmt.Printf("%s\n", errorStyle.Render("failed"))
 		fmt.Printf("  %s\n", dimStyle.Render("error: "+err.Error()))
 		fmt.Println()
 		os.Exit(1)
 	}
-	
+
 	fmt.Printf("%s\n", successStyle.Render("done"))
 	fmt.Println()
 	fmt.Println(dimStyle.Render("  restart shef to use the new version"))
 	fmt.Println()
 }
-
-
 
 func displayFacets() {
 	for _, facet := range shodanFacets {
@@ -234,19 +235,143 @@ func searchShodan(query, facet string) ([]string, error) {
 	return extractResults(content)
 }
 
-func fetchPage(url string) (string, int, error) {
-	client := &http.Client{}
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("User-Agent", uarand.GetRandom())
+// fetchProxyList fetches all 3 sources concurrently, returns whichever responds first
+func fetchProxyList() []string {
+	sources := []string{
+		"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+		"https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+		"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+	}
 
+	ch := make(chan []string, len(sources))
+	httpClient := &http.Client{Timeout: 8 * time.Second}
+
+	for _, src := range sources {
+		go func(s string) {
+			resp, err := httpClient.Get(s)
+			if err != nil {
+				ch <- nil
+				return
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			var proxies []string
+			for _, l := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+				l = strings.TrimSpace(l)
+				if l != "" {
+					proxies = append(proxies, "http://"+l)
+				}
+			}
+			ch <- proxies
+		}(src)
+	}
+
+	// return first non-empty result
+	for i := 0; i < len(sources); i++ {
+		if proxies := <-ch; len(proxies) > 0 {
+			return proxies
+		}
+	}
+	return nil
+}
+
+func doRequest(client *http.Client, targetURL string) (string, int, error) {
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	req.Header.Set("User-Agent", uarand.GetRandom())
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", 0, err
 	}
 	defer resp.Body.Close()
-
 	body, _ := io.ReadAll(resp.Body)
 	return string(body), resp.StatusCode, nil
+}
+
+func isCloudflareBlock(body string, status int) bool {
+	return (status == 403 || status == 503) &&
+		(strings.Contains(body, "cloudflare") || strings.Contains(body, "Cloudflare"))
+}
+
+func fetchPage(targetURL string) (string, int, error) {
+	// try direct first
+	directClient := &http.Client{Timeout: 15 * time.Second}
+	body, status, err := doRequest(directClient, targetURL)
+	if err == nil && status == 200 {
+		return body, status, nil
+	}
+
+	if err == nil && isCloudflareBlock(body, status) {
+		log.Warn("Direct IP blocked by Cloudflare, trying proxies...")
+	} else {
+		log.Warn("Direct request failed, trying proxies...")
+	}
+
+	// fetch all proxy sources concurrently, use first that responds
+	proxies := fetchProxyList()
+	if len(proxies) == 0 {
+		log.Error("Could not fetch proxy list")
+		return "", 0, fmt.Errorf("cloudflare_block")
+	}
+
+	rand.Shuffle(len(proxies), func(i, j int) { proxies[i], proxies[j] = proxies[j], proxies[i] })
+
+	// race proxies concurrently in batches, first success wins
+	const batchSize = 20
+	const proxyTimeout = 4 * time.Second
+
+	type result struct {
+		body   string
+		status int
+	}
+
+	for i := 0; i < len(proxies); i += batchSize {
+		end := i + batchSize
+		if end > len(proxies) {
+			end = len(proxies)
+		}
+		batch := proxies[i:end]
+
+		ch := make(chan result, 1)
+		var once sync.Once
+		var wg sync.WaitGroup
+
+		for _, p := range batch {
+			wg.Add(1)
+			go func(proxy string) {
+				defer wg.Done()
+				pURL, err := url.Parse(proxy)
+				if err != nil {
+					return
+				}
+				c := &http.Client{
+					Transport: &http.Transport{Proxy: http.ProxyURL(pURL)},
+					Timeout:   proxyTimeout,
+				}
+				b, s, err := doRequest(c, targetURL)
+				if err != nil || isCloudflareBlock(b, s) || s != 200 {
+					return
+				}
+				once.Do(func() { ch <- result{b, s} })
+			}(p)
+		}
+
+		go func() { wg.Wait(); close(ch) }()
+
+		if res, ok := <-ch; ok {
+			return res.body, res.status, nil
+		}
+	}
+
+	return "", 0, fmt.Errorf("cloudflare_block")
 }
 
 func detectErrors(html string, statusCode int) error {
