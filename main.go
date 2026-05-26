@@ -161,7 +161,7 @@ func performUpdate() {
 	fmt.Println()
 	fmt.Println(highlightStyle.Render("checking for updates..."))
 
-	latest, found, err := selfupdate.DetectLatest("1hehaq/shef")
+	latest, found, err := selfupdate.DetectLatest("shadowe1ite/shef")
 	if err != nil {
 		fmt.Printf("%s %s\n", errorStyle.Render("✗"), dimStyle.Render("error checking for updates: "+err.Error()))
 		fmt.Println()
